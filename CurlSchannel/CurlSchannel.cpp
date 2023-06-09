@@ -99,9 +99,16 @@ ssize_t our_recv(struct wintls* tls,
 	return rc;
 }
 
+
+HANDLE heap;
 void* malloc_sch(int size)
 {
-	return std::malloc(size); //operator new(size);
+	return HeapAlloc(heap, 0, size);
+}
+
+void* memcpy_sch(void* dest, const void* src, std::size_t count)
+{
+	return std::memcpy(dest, src, count);
 }
 
 void* memmove_sch(void* dest, const void* src, std::size_t count)
@@ -109,25 +116,30 @@ void* memmove_sch(void* dest, const void* src, std::size_t count)
 	return std::memmove(dest, src, count);
 }
 
-void* realloc_sch(void* dest, size_t oldCount, size_t count)
-{
-	return std::realloc(dest, count);
-	//void* new_alloced = malloc_sch(count);
-	//std::memcpy(new_alloced, dest, oldCount);
-	//operator delete(dest);
-	//return new_alloced;
-}
 
 void free_sch(void* p)
 {
-	std::free(p);
+//	std::free(p);
+	HeapFree(heap, 0, p);
 	//operator delete(p);
+}
+void* realloc_sch(void* dest, size_t oldCount, size_t count)
+{
+	return HeapReAlloc(heap, 0, dest, count);
+	//return std::realloc(dest, count);
+	//void* new_alloced = malloc_sch(count);
+	//std::memcpy(new_alloced, dest, oldCount);
+	//free_sch(dest);
+	//return new_alloced;
 }
 
 #include "curl_opts.h"
 #pragma comment(lib, "Ws2_32.lib")
 int main()
 {
+	heap = HeapCreate(0, 65536, 65536 * 10);
+
+
 	WSADATA wsaData;
 	int err = WSAStartup(MAKEWORD(2, 2), &wsaData);
 	if (err != 0)
@@ -137,7 +149,7 @@ int main()
 		return 0;
 	}
 
-	int iresult;
+	int iresult = 0;
 	struct sockaddr* serverAddr = NULL;
 	SOCKET WSSock = WSASocketA(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, 0);
 	//int ReturnValue = WSAConnect(WSSock, (SOCKADDR*)&C_Channel, sizeof(C_Channel), &CallerData, &CalleeData, NULL, NULL);
@@ -402,9 +414,10 @@ int main()
 //		char* str[STRING_LAST]; /* array of strings, pointing to allocated memory */
 //		struct curl_blob* blobs[BLOB_LAST];
 //		SOCKET socket;
+
 	char hostnamea[16] = "tls13.akamai.io";
 	char tls13[23] = "TLS_AES_256_GCM_SHA384";
-	iresult = Curl_setstropt(&tls.str[STRING_SSL_CIPHER13_LIST], "TLS_AES_256_GCM_SHA384");
+	//iresult = Curl_setstropt(&tls.str[STRING_SSL_CIPHER13_LIST], "TLS_AES_256_GCM_SHA384");
 	tls.verifyhost = TRUE;
 	tls.verifypeer = TRUE;
 	tls.verifystatus = FALSE;
@@ -416,6 +429,7 @@ int main()
 	tls.do_free = &free_sch;
 	tls.do_memmove = &memmove_sch;
 	tls.do_realloc = &realloc_sch;
+	tls.do_memcpy = &memcpy_sch;
 	tls.share = (wintls_share*)malloc_sch(sizeof(wintls_share));
 	tls.timeout = 10000;
 	tls.connecttimeout = 10000;

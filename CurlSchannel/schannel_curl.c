@@ -330,7 +330,7 @@ CURLcode Curl_pin_peer_pubkey(struct wintls* data,
 			Curl_safefree(encoded);
 			return CURLE_OUT_OF_MEMORY;
 		}
-		memcpy(pinkeycopy, pinnedpubkey, pinkeylen);
+		data->do_memcpy(pinkeycopy, pinnedpubkey, pinkeylen);
 		/* point begin_pos to the copy, and start extracting keys */
 		begin_pos = pinkeycopy;
 		do {
@@ -1688,7 +1688,7 @@ schannel_connect_step1(struct wintls* tls)
 			failf(tls, "Error setting ALPN");
 			return CURLE_SSL_CONNECT_ERROR;
 		}
-		memcpy(&alpn_buffer[cur], proto.data, proto.len);
+		tls->do_memcpy(&alpn_buffer[cur], proto.data, proto.len);
 		cur += proto.len;
 
 		*list_len = curlx_uitous(cur - list_start_index);
@@ -1798,7 +1798,7 @@ schannel_connect_step1(struct wintls* tls)
 	return CURLE_OK;
 }
 
-static CURLcode
+CURLcode
 schannel_connect_step2(struct wintls* tls)
 {
 	int i;
@@ -1853,8 +1853,8 @@ schannel_connect_step2(struct wintls* tls)
 		/* increase internal encrypted data buffer */
 		size_t reallocated_length = tls->encdata_offset +
 			CURL_SCHANNEL_BUFFER_FREE_SIZE;
-		reallocated_buffer = realloc(tls->encdata_buffer,
-			reallocated_length);
+		reallocated_buffer = tls->do_realloc(tls->encdata_buffer,
+			tls->encdata_length, reallocated_length);
 
 		if (!reallocated_buffer) {
 			failf(tls, "schannel: unable to re-allocate memory");
@@ -1916,7 +1916,7 @@ schannel_connect_step2(struct wintls* tls)
 		}
 
 		/* copy received handshake data into input buffer */
-		memcpy(inbuf[0].pvBuffer, tls->encdata_buffer,
+		tls->do_memcpy(inbuf[0].pvBuffer, tls->encdata_buffer,
 			tls->encdata_offset);
 
 		sspi_status = s_pSecFn->InitializeSecurityContextA(
@@ -1926,7 +1926,7 @@ schannel_connect_step2(struct wintls* tls)
 			&outbuf_desc, &tls->ret_flags, &tls->ctxt_time_stamp);
 
 		/* free buffer for received handshake data */
-		Curl_safefree(inbuf[0].pvBuffer);
+		tls->do_free(inbuf[0].pvBuffer);
 
 		/* check if the handshake was incomplete */
 		if (sspi_status == SEC_E_INCOMPLETE_MESSAGE) {
@@ -2597,7 +2597,7 @@ schannel_send(struct wintls* tls,
 	InitSecBufferDesc(&outbuf_desc, outbuf, 4);
 
 	/* copy data into output buffer */
-	memcpy(outbuf[1].pvBuffer, buf, len);
+	tls->do_memcpy(outbuf[1].pvBuffer, buf, len);
 
 	/* https://msdn.microsoft.com/en-us/library/windows/desktop/aa375390.aspx */
 	sspi_status = s_pSecFn->EncryptMessage(&tls->ctxt_handle, 0,
@@ -2691,7 +2691,7 @@ schannel_send(struct wintls* tls,
 		*err = CURLE_SEND_ERROR;
 	}
 
-	Curl_safefree(ptr);
+	tls->do_free(ptr);
 
 	if (len == (size_t)written)
 		/* Encrypted message including header, data and trailer entirely sent.
@@ -2864,7 +2864,7 @@ schannel_recv(struct wintls* tls,
 				/* copy decrypted data to internal buffer */
 				size = inbuf[1].cbBuffer;
 				if (size) {
-					memcpy(tls->decdata_buffer + tls->decdata_offset,
+					tls->do_memcpy(tls->decdata_buffer + tls->decdata_offset,
 						inbuf[1].pvBuffer, size);
 					tls->decdata_offset += size;
 				}
@@ -2886,7 +2886,7 @@ schannel_recv(struct wintls* tls,
 				if (tls->encdata_offset > inbuf[3].cbBuffer) {
 					/* move remaining encrypted data forward to the beginning of
 					   buffer */
-					memmove(tls->encdata_buffer,
+					tls->do_memmove(tls->encdata_buffer,
 						(tls->encdata_buffer + tls->encdata_offset) -
 						inbuf[3].cbBuffer, inbuf[3].cbBuffer);
 					tls->encdata_offset = inbuf[3].cbBuffer;
@@ -2997,8 +2997,8 @@ cleanup:
 
 	size = len < tls->decdata_offset ? len : tls->decdata_offset;
 	if (size) {
-		memcpy(buf, tls->decdata_buffer, size);
-		memmove(tls->decdata_buffer, tls->decdata_buffer + size,
+		tls->do_memcpy(buf, tls->decdata_buffer, size);
+		tls->do_memmove(tls->decdata_buffer, tls->decdata_buffer + size,
 			tls->decdata_offset - size);
 		tls->decdata_offset -= size;
 		DEBUGF(infof(tls, "schannel: decrypted data returned %zu", size));

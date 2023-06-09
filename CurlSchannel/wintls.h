@@ -69,7 +69,7 @@ typedef void*(malloc_func)(int size);
 typedef void (free_func)(void* p);
 typedef void*(memmove_func)(void* dest, const void* src, size_t count);
 typedef void* (realloc_func)(void* dest, size_t oldCount, size_t count);
-
+typedef void* (memcpy_func)(void* dest, const void* src, size_t count);
 struct curl_blob {
 	void* data;
 	size_t len;
@@ -231,6 +231,7 @@ struct wintls
 	free_func* do_free;
 	memmove_func* do_memmove;
 	realloc_func* do_realloc;
+	memcpy_func* do_memcpy;
 
 	char* pinnedPubKey;
 	unsigned int timeout;        /* ms, 0 means no timeout */
