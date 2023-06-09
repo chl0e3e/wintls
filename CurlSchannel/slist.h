@@ -1,0 +1,50 @@
+#ifndef HEADER_CURL_SLIST_H
+#define HEADER_CURL_SLIST_H
+/***************************************************************************
+ *                                  _   _ ____  _
+ *  Project                     ___| | | |  _ \| |
+ *                             / __| | | | |_) | |
+ *                            | (__| |_| |  _ <| |___
+ *                             \___|\___/|_| \_\_____|
+ *
+ * Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+ *
+ * This software is licensed as described in the file COPYING, which
+ * you should have received as part of this distribution. The terms
+ * are also available at https://curl.se/docs/copyright.html.
+ *
+ * You may opt to use, copy, modify, merge, publish, distribute and/or sell
+ * copies of the Software, and permit persons to whom the Software is
+ * furnished to do so, under the terms of the COPYING file.
+ *
+ * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY
+ * KIND, either express or implied.
+ *
+ * SPDX-License-Identifier: curl
+ *
+ ***************************************************************************/
+#define WIN32_LEAN_AND_MEAN 
+#include <Windows.h>
+#include "debug.h"
+/* linked-list structure for the CURLOPT_QUOTE option (and other) */
+struct curl_slist {
+    char* data;
+    struct curl_slist* next;
+};
+
+ /*
+  * Curl_slist_duplicate() duplicates a linked list. It always returns the
+  * address of the first record of the cloned list or NULL in case of an
+  * error (or if the input list was NULL).
+  */
+struct curl_slist* Curl_slist_duplicate(struct curl_slist* inlist);
+
+/*
+ * Curl_slist_append_nodup() takes ownership of the given string and appends
+ * it to the list.
+ */
+struct curl_slist* Curl_slist_append_nodup(struct curl_slist* list,
+    char* data);
+
+void curl_slist_free_all(struct curl_slist* list);
+#endif /* HEADER_CURL_SLIST_H */
