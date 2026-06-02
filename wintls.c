@@ -11055,223 +11055,257 @@ static wintls_code schannel_sha256sum(const unsigned char* input,
 		PROV_RSA_AES, CALG_SHA_256);
 	return WINTLS_OK;
 }
-	
 
 
 /* ======================================================================
- * source: WintlsSchannel.cpp (entry point)
+ * Public library API (wintls.h) - opaque client over the Schannel backend.
  ====================================================================== */
 
-// WintlsSchannel.cpp : Defines the entry point for the application.
+#include "wintls.h"
 
-#define WIN32_LEAN_AND_MEAN
-#include <Windows.h>
-#include <wincrypt.h>
-#include <winsock2.h>
-#include <ws2ipdef.h>
-#pragma warning(push)
-#pragma warning(disable:6385) // Invalid data: accessing [buffer-name], the readable size is size1 bytes but size2 bytes may be read
-#pragma warning(disable:6101) // Returning uninitialized memory
-#include <ws2tcpip.h>
-#include <mstcpip.h>
-#pragma warning(pop)
+struct wintls_client {
+    struct wintls tls;
+    char *hostname;       /* owned copy, referenced by tls.hostname */
+    wintls_code last_error;
+};
 
+/* --- default plumbing: CRT memory + Winsock socket I/O --- */
 
-struct wintls tls;
+static void *wintls__malloc(int size)                         { return malloc((size_t)size); }
+static void  wintls__free(void *p)                            { free(p); }
+static void *wintls__memmove(void *d, const void *s, size_t n){ return memmove(d, s, n); }
+static void *wintls__realloc(void *d, size_t oldn, size_t n)  { (void)oldn; return realloc(d, n); }
+static void *wintls__memcpy(void *d, const void *s, size_t n) { return memcpy(d, s, n); }
 
-#define WINTLS_MAX_INPUT_LENGTH 8000000
-
-wintls_code wintls_setstropt(char** charp, const char* s)
+static ssize_t wintls__send(struct wintls *tls, const void *buf,
+                            size_t len, wintls_code *err)
 {
-	/* Release the previous storage at `charp' and replace by a dynamic storage
-	   copy of `s'. Return WINTLS_OK or WINTLS_OUT_OF_MEMORY. */
-
-	wintls_safefree(*charp);
-
-	if (s) {
-		if (strlen(s) > WINTLS_MAX_INPUT_LENGTH)
-			return WINTLS_BAD_FUNCTION_ARGUMENT;
-
-		*charp = strdup(s);
-		if (!*charp)
-			return WINTLS_OUT_OF_MEMORY;
-	}
-
-	return WINTLS_OK;
+    WSABUF b;
+    DWORD sent = 0;
+    int rc;
+    b.len = (ULONG)len;
+    b.buf = (CHAR *)buf;
+    rc = WSASend(tls->socket, &b, 1, &sent, 0, NULL, NULL);
+    if (rc != 0 || sent == 0) {
+        *err = WINTLS_WRITE_ERROR;
+        return -1;
+    }
+    *err = WINTLS_OK;
+    return (ssize_t)sent;
 }
 
-
-ssize_t our_send(struct wintls* tls,
-	const void* buf,        /* data to write */
-	size_t len,             /* amount to write */
-	wintls_code* err)
+static ssize_t wintls__recv(struct wintls *tls, char *buf,
+                            size_t len, wintls_code *err)
 {
-	DWORD SendBytes;
-	WSABUF DataBuf;
-	DataBuf.len = len;
-	DataBuf.buf = (CHAR*)buf;
-
-	int rc = WSASend(tls->socket, &DataBuf, 1, &SendBytes, 0, NULL, NULL);
-	if (SendBytes <= 0)
-		*err = WINTLS_WRITE_ERROR;
-	else
-		*err = WINTLS_OK;
-	return SendBytes;
+    int rc = recv(tls->socket, buf, (int)len, 0);
+    if (rc < 0) {
+        *err = WINTLS_READ_ERROR;
+        return -1;
+    }
+    *err = WINTLS_OK;
+    return rc;
 }
 
-ssize_t our_recv(struct wintls* tls,
-	char* buf,              /* store data here */
-	size_t len,             /* amount to read */
-	wintls_code* err)
+static volatile LONG wintls__global_inited = 0;
+
+static void wintls__global_init(void)
 {
-	int rc = recv(tls->socket, buf, len, 0);
-	if (rc < 0)
-		*err = WINTLS_READ_ERROR;
-	else
-		*err = WINTLS_OK;
-	return rc;
+    if (InterlockedCompareExchange(&wintls__global_inited, 1, 0) == 0)
+        wintls_win32_init(0);
 }
 
-
-HANDLE heap;
-void* malloc_sch(int size)
+static unsigned char wintls__map_version(wintls_version v)
 {
-	return HeapAlloc(heap, 0, size);
+    switch (v) {
+    case WINTLS_TLS1_0: return WINTLS_SSLVERSION_TLSv1_0;
+    case WINTLS_TLS1_1: return WINTLS_SSLVERSION_TLSv1_1;
+    case WINTLS_TLS1_3: return WINTLS_SSLVERSION_TLSv1_3;
+    case WINTLS_TLS1_2:
+    default:            return WINTLS_SSLVERSION_TLSv1_2;
+    }
 }
 
-void* memcpy_sch(void* dest, const void* src, size_t count)
+wintls_client *wintls_client_new(void)
 {
-	return memcpy(dest, src, count);
+    wintls_client *c = (wintls_client *)calloc(1, sizeof(*c));
+    if (!c)
+        return NULL;
+
+    wintls__global_init();
+
+    c->tls.do_send    = wintls__send;
+    c->tls.do_recv    = wintls__recv;
+    c->tls.do_malloc  = wintls__malloc;
+    c->tls.do_free    = wintls__free;
+    c->tls.do_memmove = wintls__memmove;
+    c->tls.do_realloc = wintls__realloc;
+    c->tls.do_memcpy  = wintls__memcpy;
+
+    c->tls.verifypeer     = TRUE;
+    c->tls.verifyhost     = TRUE;
+    c->tls.verifystatus   = FALSE;
+    c->tls.cachesessionid = TRUE;
+    c->tls.use_alpn       = FALSE;
+
+    c->tls.version     = WINTLS_SSLVERSION_TLSv1_2;
+    c->tls.version_max = WINTLS_SSLVERSION_TLSv1_3;
+
+    c->tls.timeout        = 30000;
+    c->tls.connecttimeout = 30000;
+
+    c->tls.buffer_size = 16384;
+    c->tls.buffer = (char *)malloc(c->tls.buffer_size);
+    c->tls.share  = (struct wintls_share *)calloc(1, sizeof(struct wintls_share));
+    if (!c->tls.buffer || !c->tls.share) {
+        wintls_client_free(c);
+        return NULL;
+    }
+    return c;
 }
 
-void* memmove_sch(void* dest, const void* src, size_t count)
+void wintls_client_free(wintls_client *c)
 {
-	return memmove(dest, src, count);
+    if (!c)
+        return;
+    if (c->tls.ctxt_setup)
+        DeleteSecurityContext(&c->tls.ctxt_handle);
+    if (c->tls.cred_setup)
+        FreeCredentialsHandle(&c->tls.cred_handle);
+    if (c->tls.encdata_buffer)
+        free(c->tls.encdata_buffer);
+    if (c->tls.decdata_buffer)
+        free(c->tls.decdata_buffer);
+    free(c->tls.buffer);
+    free(c->tls.share);
+    free(c->hostname);
+    free(c);
 }
 
-void free_sch(void* p)
+void wintls_set_verify(wintls_client *c, int verify_peer, int verify_host)
 {
-	HeapFree(heap, 0, p);
+    if (!c)
+        return;
+    c->tls.verifypeer = verify_peer ? TRUE : FALSE;
+    c->tls.verifyhost = verify_host ? TRUE : FALSE;
 }
 
-void* realloc_sch(void* dest, size_t oldCount, size_t count)
+void wintls_set_versions(wintls_client *c,
+                         wintls_version min_ver, wintls_version max_ver)
 {
-	return HeapReAlloc(heap, 0, dest, count);
+    if (!c)
+        return;
+    c->tls.version     = wintls__map_version(min_ver);
+    c->tls.version_max = wintls__map_version(max_ver);
 }
 
-#pragma comment(lib, "Ws2_32.lib")
-int main()
+void wintls_set_alpn(wintls_client *c, int enable_http11)
 {
-	heap = HeapCreate(0, 65536, 65536 * 10);
+    if (c)
+        c->tls.use_alpn = enable_http11 ? TRUE : FALSE;
+}
 
-	WSADATA wsaData;
-	int err = WSAStartup(MAKEWORD(2, 2), &wsaData);
-	if (err != 0)
-	{
-		printf("Startup error");
-		WSACleanup();
-		return 0;
-	}
+void wintls_set_timeout_ms(wintls_client *c,
+                           unsigned int connect_ms, unsigned int io_ms)
+{
+    if (!c)
+        return;
+    c->tls.connecttimeout = connect_ms;
+    c->tls.timeout = io_ms;
+}
 
-	int iresult = 0;
-	struct sockaddr* serverAddr = NULL;
-	SOCKET WSSock = WSASocketA(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, 0);
+int wintls_connect(wintls_client *c, SOCKET sock,
+                   const char *hostname, int port)
+{
+    wintls_code code;
+    size_t hlen;
 
-	ADDRINFOW* result = NULL;
-	ADDRINFOW hints;
-	ULONG serverAddrLen = 0;
+    if (!c || !hostname)
+        return -1;
 
-	ZeroMemory(&hints, sizeof(hints));
-	hints.ai_family = AF_INET;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_protocol = IPPROTO_TCP;
-	int rresult = GetAddrInfoW(
-		L"tls13.akamai.io",
-		L"443",
-		&hints,
-		&result
-	);
-	if (rresult != 0) {
-		wprintf(L"GetAddrInfoW failed with error: %d\n", rresult);
-		WSACleanup();
-		return 1;
-	}
+    hlen = strlen(hostname) + 1;
+    free(c->hostname);
+    c->hostname = (char *)malloc(hlen);
+    if (!c->hostname) {
+        c->last_error = WINTLS_OUT_OF_MEMORY;
+        return -1;
+    }
+    memcpy(c->hostname, hostname, hlen);
 
-	serverAddr = result->ai_addr;
-	serverAddrLen = (ULONG)result->ai_addrlen;
+    c->tls.socket        = sock;
+    c->tls.hostname      = c->hostname;
+    c->tls.port          = port;
+    c->tls.t_startop     = wintls_now();
+    c->tls.t_startsingle = wintls_now();
 
-	int sockErr = WSAConnect(
-		WSSock,
-		serverAddr,
-		serverAddrLen,
-		NULL,
-		NULL,
-		NULL,
-		NULL
-	);
-	if (sockErr == SOCKET_ERROR)
-	{
-		iresult = WSAGetLastError();
-		wprintf(L"WSAConnect returned error %d\n", iresult);
-		WSACleanup();
-		return 0;
-	}
+    code = schannel_connect(&c->tls);
+    c->last_error = code;
+    return (code == WINTLS_OK) ? 0 : -1;
+}
 
-	wintls_win32_init(0);
+int wintls_send(wintls_client *c, const void *buf, size_t len)
+{
+    wintls_code code;
+    ssize_t n;
 
-	char hostnamea[16] = "tls13.akamai.io";
-	char tls13[23] = "TLS_AES_256_GCM_SHA384";
-	tls.verifyhost = TRUE;
-	tls.verifypeer = TRUE;
-	tls.verifystatus = FALSE;
-	tls.cachesessionid = TRUE;
-	tls.socket = WSSock;
-	tls.do_recv = &our_recv;
-	tls.do_send = &our_send;
-	tls.do_malloc = &malloc_sch;
-	tls.do_free = &free_sch;
-	tls.do_memmove = &memmove_sch;
-	tls.do_realloc = &realloc_sch;
-	tls.do_memcpy = &memcpy_sch;
-	tls.share = (struct wintls_share*)malloc_sch(sizeof(struct wintls_share));
-	tls.timeout = 10000;
-	tls.connecttimeout = 10000;
-	tls.t_startop = wintls_now();
-	tls.t_startsingle = wintls_now();
-	tls.hostname = hostnamea;
-	tls.port = 443;
-	tls.buffer_size = 16384;
-	tls.use_alpn = TRUE;
-	tls.buffer = (char*)malloc_sch(tls.buffer_size);
-	tls.version = WINTLS_SSLVERSION_TLSv1_2;
-	tls.version_max = WINTLS_SSLVERSION_TLSv1_3;
-	tls.cipher_list13 = tls13;
+    if (!c)
+        return -1;
+    for (;;) {
+        /* schannel_send() leaves *err untouched on the success path, so seed
+           it with WINTLS_OK before every call. */
+        code = WINTLS_OK;
+        n = schannel_send(&c->tls, buf, len, &code);
+        if (code == WINTLS_OK)
+            return (int)n;
+        if (code == WINTLS_AGAIN) {
+            Sleep(10);
+            continue;
+        }
+        c->last_error = code;
+        return -1;
+    }
+}
 
-	wintls_code code = schannel_connect(&tls);
+int wintls_recv(wintls_client *c, void *buf, size_t len)
+{
+    wintls_code code;
+    ssize_t n;
 
-	const char* request = "GET / HTTP/1.1\r\nHost: tls13.akamai.io\r\n\r\n";
-	schannel_send(&tls, request, strlen(request), &code);
+    if (!c)
+        return -1;
+    for (;;) {
+        code = WINTLS_OK;
+        n = schannel_recv(&c->tls, (char *)buf, len, &code);
+        if (code == WINTLS_OK)
+            return (int)n;            /* 0 => peer closed the connection */
+        if (code == WINTLS_AGAIN) {
+            Sleep(10);
+            continue;
+        }
+        c->last_error = code;
+        return -1;
+    }
+}
 
-	char* buffer = (char*)malloc_sch(4096);
-	long long b = schannel_recv(&tls, buffer, 4096, &code);
-	while (code == WINTLS_AGAIN)
-	{
-		Sleep(100);
-		b = schannel_recv(&tls, buffer, 4096, &code);
-		printf("%*.*s\n", (int)b, (int)b, buffer);
-	}
+int wintls_last_error(const wintls_client *c)
+{
+    return c ? (int)c->last_error : -1;
+}
 
-	if (code == WINTLS_OK && b == 4096)
-	{
-		while (code == WINTLS_OK)
-		{
-			Sleep(100);
-			b = schannel_recv(&tls, buffer, 4096, &code);
-			printf("%*.*s\n", (int)b, (int)b, buffer);
-		}
-	}
-
-	FreeAddrInfoW(result);
-	WSACleanup();
-	return 0;
+const char *wintls_error_string(int code)
+{
+    switch (code) {
+    case WINTLS_OK:                      return "no error";
+    case WINTLS_SSL_CONNECT_ERROR:       return "TLS handshake failed";
+    case WINTLS_PEER_FAILED_VERIFICATION:return "certificate verification failed";
+    case WINTLS_SSL_CACERT_BADFILE:      return "could not verify CA certificate";
+    case WINTLS_SSL_CIPHER:              return "no usable cipher";
+    case WINTLS_SEND_ERROR:
+    case WINTLS_WRITE_ERROR:             return "error sending data";
+    case WINTLS_RECV_ERROR:
+    case WINTLS_READ_ERROR:              return "error receiving data";
+    case WINTLS_OPERATION_TIMEDOUT:      return "operation timed out";
+    case WINTLS_OUT_OF_MEMORY:           return "out of memory";
+    case WINTLS_BAD_FUNCTION_ARGUMENT:   return "bad argument";
+    default:                             return "TLS error";
+    }
 }
